@@ -24,6 +24,7 @@ and place them in `./data/imagenet64`. Our implementation removes the duplicate 
 
 Load pretrained models by placing the `config.json` and `checkpoint.pt` in a shared folder and load them for example via
 ```python
+from uqdm import load_checkpoint, load_data
 model = load_checkpoint('checkpoints/uqdm-tiny')
 train_iter, eval_iter = load_data('ImageNet64', model.config.data)
 ```
@@ -35,16 +36,12 @@ model.trainer(train_iter, eval_iter)
 model.evaluate(eval_iter)
 ```
 
-To save the compressed representation of an image use
+To save the compressed representation of an image and to reconstruct an image/images from their compressed representations, use
 
 ```python
+image = next(iter(eval_iter))
 compressed = model.compress(image)
-```
-
-To reconstruct an image/images from their compressed representations, use
-
-```python
-reconstructions = model.decompress(image)
+reconstructions = model.decompress(compressed)
 ```
 
 ## Citation
