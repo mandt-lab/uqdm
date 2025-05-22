@@ -1,0 +1,16 @@
+name: uqdm
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.8
+  - pytorch
+  - torchvision
+  - torchaudio
+  - pip
+  - pip:
+    - ml_collections
+    - numpy
+    - zipfile
+    - tqdm

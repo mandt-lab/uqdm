@@ -49,7 +49,7 @@ def rd_fid(dataset='imagenet', baselines=None):
         'vdm-d': dict(ls='-+', color='blue', label='VDM T=20, denoise', alpha=0.6, lw=1.5),
         'vdm-a': dict(ls='--x', color='blue', label='VDM T=20, ancestral', alpha=0.6, lw=1.5),
         'vdm-f': dict(ls=':x', color='blue', label='VDM T=20, flow-based', alpha=0.6, lw=1.5),
-        'vdm-1000d': dict(ls=':+', color='darkturquoise', label='VDM T=1000, denoise'),
+        'vdm-1000d': dict(ls=':+', color='darkturquoise', label='VDM T=1000, denoise', alpha=0.6, lw=1.5),
         'jpeg': dict(ls='-.+', color='red', label='JPEG'),
         'jpeg2000': dict(ls='-x', color='red', label='JPEG2000'),
         'bpg': dict(ls='-x', color='sienna', label='BPG'),
@@ -89,3 +89,12 @@ if __name__ == '__main__':
     # Rate-distortion, Rate-Realism
     rd_fid(dataset='cifar')
     rd_fid(dataset='imagenet')
+    # Plots from the slides
+    # Gaussian vs Uniform
+    # rd_fid(dataset='imagenet', baselines=['vdm', 'uqdm'])
+    # Traditional Baselines
+    # rd_fid(dataset='imagenet', baselines=['jpeg', 'jpeg2000', 'bpg', 'uqdm'])
+    # Neural Baselines
+    # rd_fid(dataset='imagenet', baselines=['ctc', 'cdc', 'vae', 'uqdm'])
+    # Progressive Baselines
+    # rd_fid(dataset='imagenet', baselines=['jpeg2000', 'ctc', 'uqdm'])

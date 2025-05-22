@@ -1,0 +1,46 @@
+{
+  "restore_ckpt": "checkpoint.pt",
+  "model": {
+    "n_timesteps": 4,
+    "prior_type": "logistic",
+    "range_coder_precision": 14,
+    "learned_prior_scale": true,
+    "base_prior_scale": "forward_kernel",
+    "noise_schedule": "learned_linear",
+    "fix_gamma_max": true,
+    "gamma_min": -12.3,
+    "gamma_max": 6.0,
+    "attention_everywhere": false,
+    "use_fourier_features": true,
+    "ema_rate": 0.9999,
+    "n_attention_heads": 1,
+    "n_channels": 3,
+    "vocab_size": 256,
+    "embedding_dim": 32,
+    "n_blocks": 1,
+    "dropout_prob": 0.0,
+    "norm_groups": 8
+  },
+  "training": {
+    "n_steps": 500000,
+    "log_metrics_every_steps": 1000,
+    "checkpoint_every_steps": 10000,
+    "eval_every_steps": 10000,
+    "eval_steps_to_run": 50
+  },
+  "optim": {
+    "weight_decay": 0,
+    "beta1": 0.9,
+    "eps": 1e-08,
+    "warmup": 1000,
+    "lr": 0.0002,
+    "grad_clip_norm": 1.0
+  },
+  "data": {
+    "shuffle": false,
+    "pin_memory": true,
+    "batch_size": 2,
+    "num_workers": 1,
+    "data_spec": "imagenet"
+  }
+}
