@@ -781,37 +781,6 @@ class Diffusion(torch.nn.Module):
         z_s, rate = self.relative_entropy_coding(q_s_t, p_s_t)
         return z_s, rate
 
-    def denoise_z_t(self, z_t, recon_method, times=None):
-        """
-        Make a progressive data reconstruction based on z_t and compute its reconstruction quality.
-
-        Inputs:
-        -------
-        z_t          - noisy diffusion latent variable
-        recon_method - one of 'denoise', 'ancestral', 'flow_based'
-        times        - remaining time steps including current t, for ancestral / flow-based sampling
-        """
-        if recon_method == 'ancestral':
-            x_hat_t = self.sample(
-                times=times, init_z=z_t,
-                clip_samples=True, decode_method='argmax', return_hist=False
-            )
-        elif recon_method == 'flow_based':
-            x_hat_t = self.sample(
-                times=times, init_z=z_t, deterministic=True,
-                clip_samples=False, decode_method='argmax', return_hist=False
-            )
-        elif recon_method == 'denoise':
-            # Load from cache
-            assert self.denoised is not None
-            # Map to data space
-            x_hat_t = self.decode_p_x_z_0(z_0=self.denoised, method='argmax')
-            self.denoised = None
-        else:
-            raise ValueError(f"Unknown progressive reconstruction method {recon_method}")
-
-        return x_hat_t
-
     def forward(self, x_raw, z_1=None, recon_method=None):
         """
         Run a given data batch through the encoding/decoding path and compute the loss and other metrics.
@@ -906,46 +875,58 @@ class Diffusion(torch.nn.Module):
 
         return loss, metrics
 
-    @staticmethod
-    def get_noise_schedule(config):
-        # gamma is the negative log-snr as in VDM eq (3)
-        gamma_min, gamma_max, schedule = [getattr(config.model, k) for k in
-                                          ['gamma_min', 'gamma_max', 'noise_schedule']]
-        assert gamma_max > gamma_min, "SNR should be decreasing in time"
-        if schedule == "fixed_linear":
-            gamma = Diffusion.FixedLinearSchedule(gamma_min, gamma_max)
-        elif schedule == "learned_linear":
-            gamma = Diffusion.LearnedLinearSchedule(gamma_min, gamma_max, config.model.get('fix_gamma_max'))
-        # elif:    # add different noise schedules here
+    @torch.no_grad()
+    def sample(self, init_z=None, shape=None, times=None, deterministic=False,
+               clip_samples=False, decode_method='argmax', return_hist=False):
+        """
+        Perform ancestral / flow-based sampling.
+
+        Inputs:
+        -------
+        init_z        - latent state [B, C, H, W]
+        shape         - if no init_z is given specify the shape of z instead
+        times         - (optional) provide a custom (e.g. partial) sequence of steps
+        deterministic - use flow-based sampling instead of ancestral sampling
+        clip_samples  - clip latents to [-1, 1]
+        decode_method - 'argmax' or 'sample'
+        return_hist   - if set return full history of latent states
+        """
+        if init_z is None:
+            assert shape is not None
+            p_1 = self.p_1()
+            z = p_1.sample(shape)
         else:
-            raise ValueError('Unknown noise schedule %s' % schedule)
-        return gamma
+            z = init_z
+        if return_hist:
+            samples = [z]
+        if times is None:
+            times = torch.linspace(1.0, 0.0, self.config.model.n_timesteps + 1, device=device)
 
-    class FixedLinearSchedule(torch.nn.Module):
-        def __init__(self, gamma_min, gamma_max):
-            super().__init__()
-            self.gamma_min = gamma_min
-            self.gamma_max = gamma_max
-
-        def forward(self, t):
-            return self.gamma_min + (self.gamma_max - self.gamma_min) * t
-
-    class LearnedLinearSchedule(torch.nn.Module):
-        def __init__(self, gamma_min, gamma_max, fix_gamma_max=False):
-            super().__init__()
-            self.fix_gamma_max = fix_gamma_max
-            if fix_gamma_max:
-                self.gamma_max = torch.tensor(gamma_max)
+        # for i in trange(len(times) - 1, desc="sampling"):
+        for i in range(len(times) - 1):
+            p_loc, p_scale = self.get_s_t_params(z, times[i], times[i + 1], clip_samples, deterministic=deterministic)
+            if deterministic:
+                z = p_loc
             else:
-                self.b = torch.nn.Parameter(torch.tensor(gamma_min))
-            self.w = torch.nn.Parameter(torch.tensor(gamma_max - gamma_min))
+                z = self.p_s_t(p_loc, p_scale, times[i], times[i + 1]).sample()
+            if return_hist:
+                samples.append(z)
+        x_raw = self.decode_p_x_z_0(z_0=z, method=decode_method)
 
-        def forward(self, t):
-            w = self.w.abs()
-            if self.fix_gamma_max:
-                return w * (t - 1.) + self.gamma_max
-            else:
-                return self.b + w * t
+        if return_hist:
+            return x_raw, samples + [x_raw]
+        else:
+            return x_raw
+
+    @torch.inference_mode()
+    def compress(self, image):
+        # return a generator for the bits for each step
+        raise NotImplementedError
+
+    @torch.inference_mode()
+    def decompress(self, compressed):
+        # consume the bits for each step, return a generator for the intermediate reconstructions for each step
+        raise NotImplementedError
 
     def log_probs_x_z0(self, z_0, x_raw=None):
         """
@@ -1017,58 +998,77 @@ class Diffusion(torch.nn.Module):
             raise ValueError(f"Unknown decoding method {method}")
         return x_raw
 
-    @torch.no_grad()
-    def sample(self, init_z=None, shape=None, times=None, deterministic=False,
-               clip_samples=False, decode_method='argmax', return_hist=False):
+    def denoise_z_t(self, z_t, recon_method, times=None):
         """
-        Perform ancestral / flow-based sampling.
+        Make a progressive data reconstruction based on z_t and compute its reconstruction quality.
 
         Inputs:
         -------
-        init_z        - latent state [B, C, H, W]
-        shape         - if no init_z is given specify the shape of z instead
-        times         - (optional) provide a custom (e.g. partial) sequence of steps
-        deterministic - use flow-based sampling instead of ancestral sampling
-        clip_samples  - clip latents to [-1, 1]
-        decode_method - 'argmax' or 'sample'
-        return_hist   - if set return full history of latent states
+        z_t          - noisy diffusion latent variable
+        recon_method - one of 'denoise', 'ancestral', 'flow_based'
+        times        - remaining time steps including current t, for ancestral / flow-based sampling
         """
-        if init_z is None:
-            assert shape is not None
-            p_1 = self.p_1()
-            z = p_1.sample(shape)
+        if recon_method == 'ancestral':
+            x_hat_t = self.sample(
+                times=times, init_z=z_t,
+                clip_samples=True, decode_method='argmax', return_hist=False
+            )
+        elif recon_method == 'flow_based':
+            x_hat_t = self.sample(
+                times=times, init_z=z_t, deterministic=True,
+                clip_samples=False, decode_method='argmax', return_hist=False
+            )
+        elif recon_method == 'denoise':
+            # Load from cache
+            assert self.denoised is not None
+            # Map to data space
+            x_hat_t = self.decode_p_x_z_0(z_0=self.denoised, method='argmax')
+            self.denoised = None
         else:
-            z = init_z
-        if return_hist:
-            samples = [z]
-        if times is None:
-            times = torch.linspace(1.0, 0.0, self.config.model.n_timesteps + 1, device=device)
+            raise ValueError(f"Unknown progressive reconstruction method {recon_method}")
 
-        # for i in trange(len(times) - 1, desc="sampling"):
-        for i in range(len(times) - 1):
-            p_loc, p_scale = self.get_s_t_params(z, times[i], times[i+1], clip_samples, deterministic=deterministic)
-            if deterministic:
-                z = p_loc
+        return x_hat_t
+
+    @staticmethod
+    def get_noise_schedule(config):
+        # gamma is the negative log-snr as in VDM eq (3)
+        gamma_min, gamma_max, schedule = [getattr(config.model, k) for k in
+                                          ['gamma_min', 'gamma_max', 'noise_schedule']]
+        assert gamma_max > gamma_min, "SNR should be decreasing in time"
+        if schedule == "fixed_linear":
+            gamma = Diffusion.FixedLinearSchedule(gamma_min, gamma_max)
+        elif schedule == "learned_linear":
+            gamma = Diffusion.LearnedLinearSchedule(gamma_min, gamma_max, config.model.get('fix_gamma_max'))
+        # elif:    # add different noise schedules here
+        else:
+            raise ValueError('Unknown noise schedule %s' % schedule)
+        return gamma
+
+    class FixedLinearSchedule(torch.nn.Module):
+        def __init__(self, gamma_min, gamma_max):
+            super().__init__()
+            self.gamma_min = gamma_min
+            self.gamma_max = gamma_max
+
+        def forward(self, t):
+            return self.gamma_min + (self.gamma_max - self.gamma_min) * t
+
+    class LearnedLinearSchedule(torch.nn.Module):
+        def __init__(self, gamma_min, gamma_max, fix_gamma_max=False):
+            super().__init__()
+            self.fix_gamma_max = fix_gamma_max
+            if fix_gamma_max:
+                self.gamma_max = torch.tensor(gamma_max)
             else:
-                z = self.p_s_t(p_loc, p_scale, times[i], times[i+1]).sample()
-            if return_hist:
-                samples.append(z)
-        x_raw = self.decode_p_x_z_0(z_0=z, method=decode_method)
+                self.b = torch.nn.Parameter(torch.tensor(gamma_min))
+            self.w = torch.nn.Parameter(torch.tensor(gamma_max - gamma_min))
 
-        if return_hist:
-            return x_raw, samples + [x_raw]
-        else:
-            return x_raw
-
-    @torch.inference_mode()
-    def compress(self, image):
-        # return a generator for the bits for each step
-        raise NotImplementedError
-
-    @torch.inference_mode()
-    def decompress(self, compressed):
-        # consume the bits for each step, return a generator for the intermediate reconstructions for each step
-        raise NotImplementedError
+        def forward(self, t):
+            w = self.w.abs()
+            if self.fix_gamma_max:
+                return w * (t - 1.) + self.gamma_max
+            else:
+                return self.b + w * t
 
     def save(self):
         torch.save({
@@ -1346,13 +1346,14 @@ class UQDM(Diffusion):
             # Apply universal quantization
             # shared U(-0.5, 0.5)
             if seed:
-                gen = torch.Generator(q.mean.device).manual_seed(seed)
-                u = torch.rand(q.mean.shape, device=q.mean.device, generator=gen) - 0.5
+                with torch.random.fork_rng():
+                    torch.manual_seed(seed)
+                    u = torch.rand(q.mean.shape, device=q.mean.device) - 0.5
             else:
                 u = torch.rand(q.mean.shape, device=q.mean.device) - 0.5
 
             # Add dither U(-delta/2, delta/2)
-            quantized = torch.round(q.mean + p.delta * u / p.delta)
+            quantized = torch.round((q.mean + p.delta * u) / p.delta)
             # Subtract the same (pseudo-random) dither using shared randomness
             z_s = quantized * p.delta - p.delta * u
 
