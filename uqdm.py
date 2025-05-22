@@ -11,6 +11,7 @@ import numpy as np
 import json
 import os
 from pathlib import Path
+from contextlib import contextmanager
 import zipfile
 from tqdm import tqdm
 
@@ -781,7 +782,7 @@ class Diffusion(torch.nn.Module):
         z_s, rate = self.relative_entropy_coding(q_s_t, p_s_t)
         return z_s, rate
 
-    def forward(self, x_raw, z_1=None, recon_method=None):
+    def forward(self, x_raw, z_1=None, recon_method=None, seed=None):
         """
         Run a given data batch through the encoding/decoding path and compute the loss and other metrics.
 
@@ -791,6 +792,7 @@ class Diffusion(torch.nn.Module):
         z_1          - if provided, will use this as the topmost latent state instead of sampling from q(z_1 | x).
         recon_method - (optional) one of ['ancestral', 'denoise', 'flow-based']; determines how a progressive
                        reconstruction will be computed based on an intermediate latent state.
+        seed         - allow for common randomness
         """
         rescale_to_bpd = 1. / (np.prod(x_raw.shape[1:]) * np.log(2.))
 
@@ -803,14 +805,16 @@ class Diffusion(torch.nn.Module):
             # During training me might want to optimize the noise schedule so use the full NELBO
             q_1 = self.q_t(x)
             p_1 = self.p_1()
-            z_1 = q_1.sample()
+            with local_seed(seed, i=0):
+                z_1 = q_1.sample()
             loss_prior = kl_divergence(q_1, p_1).sum(dim=[1, 2, 3])
         else:
             # In actual compression, we can't do REC for the Gaussian q(z_1|x) under p(z_1), so
             # instead both encoder/decoder will draw from p(z_1).
             if z_1 is None:
                 p_1 = self.p_1()
-                z_1 = p_1.sample(x.shape)
+                with local_seed(seed, i=0):
+                    z_1 = p_1.sample(x.shape)
             loss_prior = torch.zeros(x.shape[0], device=device)
 
         # 2. DIFFUSION LOSS
@@ -825,7 +829,8 @@ class Diffusion(torch.nn.Module):
             z_t = z_s
             rate_t = rate_s
             t, s = times[i], times[i + 1]
-            z_s, rate_s = self.transmit_q_s_t(x, z_t, t, s, cache_denoised=recon_method == 'denoise')
+            with local_seed(seed, i=i+1):
+                z_s, rate_s = self.transmit_q_s_t(x, z_t, t, s, cache_denoised=recon_method == 'denoise')
             loss_diff += rate_s
 
             if recon_method is not None:
@@ -904,11 +909,12 @@ class Diffusion(torch.nn.Module):
 
         # for i in trange(len(times) - 1, desc="sampling"):
         for i in range(len(times) - 1):
-            p_loc, p_scale = self.get_s_t_params(z, times[i], times[i + 1], clip_samples, deterministic=deterministic)
+            t, s = times[i], times[i+1]
+            p_loc, p_scale = self.get_s_t_params(z, t, s, clip_denoised=clip_samples, deterministic=deterministic)
             if deterministic:
                 z = p_loc
             else:
-                z = self.p_s_t(p_loc, p_scale, times[i], times[i + 1]).sample()
+                z = self.p_s_t(p_loc, p_scale, t, s).sample()
             if return_hist:
                 samples.append(z)
         x_raw = self.decode_p_x_z_0(z_0=z, method=decode_method)
@@ -1140,7 +1146,7 @@ class Diffusion(torch.nn.Module):
             return -10 * (np.log10(mse) - 2 * np.log10(max_val))
 
     @torch.inference_mode()
-    def evaluate(self, eval_iter, n_batches=None):
+    def evaluate(self, eval_iter, n_batches=None, seed=None):
         """
         Evaluate rate-distortion on the test set.
 
@@ -1154,7 +1160,7 @@ class Diffusion(torch.nn.Module):
             X = X.to(device)
             ths_res = {}
             for recon_method in ('denoise', 'ancestral', 'flow_based'):
-                loss, metrics = self(X, recon_method=recon_method)
+                loss, metrics = self(X, recon_method=recon_method, seed=seed)
                 bpds = np.cumsum(metrics['prog_bpds'].mean(dim=1))
                 psnrs = self.mse_to_psnr(metrics['prog_mses'].mean(dim=1), max_val=255.)
                 ths_res[recon_method] = dict(bpds=bpds, psnrs=psnrs)
@@ -1165,6 +1171,18 @@ class Diffusion(torch.nn.Module):
             bpps = np.round(3 * res[recon_method]['bpds'].mean(axis=0).numpy(), 4)
             psnrs = np.round(res[recon_method]['psnrs'].mean(axis=0).numpy(), 4)
             print('Reconstructions via: %s\nbpps:  %s\npsnrs: %s\n' % (recon_method, bpps, psnrs))
+
+
+@contextmanager
+def local_seed(seed, i=0):
+    # Allow for local randomness, use hashing to get unique local seeds for subsequent draws
+    if seed is None:
+        yield
+    else:
+        with torch.random.fork_rng():
+            local_seed = hash((seed, i)) % (2 ** 32)
+            torch.manual_seed(local_seed)
+            yield
 
 
 class LogisticDistribution(TransformedDistribution):
@@ -1373,7 +1391,7 @@ if __name__ == '__main__':
     train_iter, eval_iter = load_data('ImageNet64', model.config.data)
 
     # model.trainer(train_iter, eval_iter)
-    model.evaluate(eval_iter, n_batches=10)
+    model.evaluate(eval_iter, n_batches=10, seed=seed)
 
     # Run inference for one image
     # image = next(iter(eval_iter))
