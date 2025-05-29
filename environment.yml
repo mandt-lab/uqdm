@@ -12,5 +12,4 @@ dependencies:
   - pip:
     - ml_collections
     - numpy
-    - zipfile
     - tqdm

@@ -63,8 +63,6 @@ class VDM_Net(torch.nn.Module):
         import numpy as np
         return math.log(np.expm1(x))
 
-    SOFTPLUS_INV1 = softplus_inverse(1.0)
-
     def softplus_init1(self, x):
         # Softplus with a shift to bias the output towards 1.0.
         return torch.nn.functional.softplus(x + self.SOFTPLUS_INV1)
@@ -135,6 +133,8 @@ class VDM_Net(torch.nn.Module):
             nn.SiLU(),
             zero_init(nn.Conv2d(mcfg.embedding_dim, output_channels, kernel_size=3, padding=1)),
         )
+
+        self.SOFTPLUS_INV1 = self.softplus_inverse(1.0)
 
     def forward(self, z, g_t):
         # Get gamma to shape (B, ).
