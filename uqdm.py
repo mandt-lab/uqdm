@@ -5,6 +5,10 @@ from torch.distributions import constraints, TransformedDistribution, SigmoidTra
 from torch.distributions import Normal, Uniform
 from torch.distributions.kl import kl_divergence
 
+# For compression to bits only
+from tensorflow_compression.python.ops import gen_ops
+import tensorflow as tf
+
 from itertools import islice
 from ml_collections import ConfigDict
 import numpy as np
@@ -577,8 +581,284 @@ def load_checkpoint(path):
 
 
 """
-UQDM: Diffusion model + codec
+UQDM: Diffusion model, Distributions, Entropy Coding, UQDM
 """
+
+@contextmanager
+def local_seed(seed, i=0):
+    # Allow for local randomness, use hashing to get unique local seeds for subsequent draws
+    if seed is None:
+        yield
+    else:
+        with torch.random.fork_rng():
+            local_seed = hash((seed, i)) % (2 ** 32)
+            torch.manual_seed(local_seed)
+            yield
+
+
+class LogisticDistribution(TransformedDistribution):
+    """
+    Creates a logistic distribution parameterized by :attr:`loc` and :attr:`scale`
+    that define the affine transform of a standard logistic distribution.
+    Patterned after https://github.com/pytorch/pytorch/blob/main/torch/distributions/logistic_normal.py
+
+    Args:
+        loc (float or Tensor): mean of the base distribution
+        scale (float or Tensor): standard deviation of the base distribution
+
+    """
+    arg_constraints = {"loc": constraints.real, "scale": constraints.positive}
+
+    def __init__(self, loc, scale, validate_args=None):
+        self.loc = loc
+        self.scale = scale
+        base_dist = Uniform(torch.tensor(0, dtype=loc.dtype, device=loc.device),
+                            torch.tensor(1, dtype=loc.dtype, device=loc.device))
+        if not base_dist.batch_shape:
+            base_dist = base_dist.expand([1])
+        transforms = [SigmoidTransform().inv, AffineTransform(loc=loc, scale=scale)]
+        super().__init__(
+            base_dist, transforms, validate_args=validate_args
+        )
+
+    @property
+    def mean(self):
+        return self.loc
+
+    def expand(self, batch_shape, _instance=None):
+        new = self._get_checked_instance(LogisticDistribution, _instance)
+        return super().expand(batch_shape, _instance=new)
+
+    def cdf(self, x):
+        # Should be numerically more stable than the default.
+        return torch.sigmoid((x - self.loc) / self.scale)
+
+    @staticmethod
+    def log_sigmoid(x):
+        # A numerically more stable implementation of torch.log(torch.sigmoid(x)).
+        # c.f. https://jax.readthedocs.io/en/latest/_autosummary/jax.nn.log_sigmoid.html#jax.nn.log_sigmoid
+        return -torch.nn.functional.softplus(-x)
+
+    def log_cdf(self, x):
+        standardized = (x - self.loc) / self.scale
+        return self.log_sigmoid(standardized)
+
+    def log_survival_function(self, x):
+        standardized = (x - self.loc) / self.scale
+        return self.log_sigmoid(- standardized)
+
+
+class NormalDistribution(torch.distributions.Normal):
+    """
+    Overrides the Normal distribution to add a numerically more stable log_cdf
+    """
+
+    def log_cdf(self, x):
+        x = (x - self.loc) / self.scale
+        # more stable, for float32 ported from JAX, using log(1-x) ~= -x, x >> 1
+        # for small x
+        x_l = torch.clip(x, max=-10)
+        log_scale = -0.5 * x_l ** 2 - torch.log(-x_l) - 0.5 * np.log(2. * np.pi)
+        # asymptotic series
+        even_sum = torch.zeros_like(x)
+        odd_sum = torch.zeros_like(x)
+        x_2n = x_l ** 2
+        for n in range(1, 3 + 1):
+            y = np.prod(np.arange(2 * n - 1, 1, -2)) / x_2n
+            if n % 2:
+                odd_sum += y
+            else:
+                even_sum += y
+            x_2n *= x_l ** 2
+        x_lower = log_scale + torch.log(1 + even_sum - odd_sum)
+        return torch.where(
+            x > 5, -torch.special.ndtr(-x),
+            torch.where(x > -10, torch.special.ndtr(torch.clip(x, min=-10)).log(), x_lower))
+
+    def log_survival_function(self, x):
+        raise NotImplementedError
+
+
+class UniformNoisyDistribution(torch.distributions.Distribution):
+    """
+    Add uniform noise U[-delta/2, +delta/2] to a distribution.
+    Adapted from https://github.com/tensorflow/compression/blob/master/tensorflow_compression/python/distributions/uniform_noise.py
+    Also see https://pytorch.org/docs/stable/_modules/torch/distributions/distribution.html
+    """
+
+    arg_constraints = {}
+    # arg_constraints = {"delta": torch.distributions.constraints.nonnegative}
+
+    def __init__(self, base_dist, delta):
+        super().__init__()
+        self.base_dist = base_dist
+        self.delta = delta  # delta is the noise width.
+        self.half = delta / 2.
+        self.log_delta = torch.log(delta)
+
+    def sample(self, sample_shape=torch.Size([])):
+        x = self.base_dist.sample(sample_shape)
+        x += self.delta * torch.rand(x.shape, dtype=x.dtype, device=x.device) - self.half
+        return x
+
+    @property
+    def mean(self):
+        return self.base_dist.mean
+
+    def discretize(self, u, tail_mass=2 ** -8):
+        """
+        Turn the continuous distribution into a discrete one by discretizing to the grid u + k * delta.
+        Returns the pmf of k = round((x -  p_mean) / delta + u) as this is used for UQ, ignoring outlier values in the tails.
+        """
+        # For quantiles: Because p(x) = (G(x+d/2) - G(x-d/2))/d,
+        # P(X <= x) = 1/d int_{x-d/2}^{x+d/2} G(u) du <= G(x+d/2) or >= G(x-d/2) which might be tighter for small d
+        # P(X <= G^-1(a) - d/2) <= a, P(K <= (G^-1(a) - p_mean)/d - 1/2 - p_mean/d + u) <= a
+        L = torch.floor((self.base_dist.icdf(tail_mass / 2) - self.base_dist.mean).min() / self.delta - 0.5)
+        R = torch.ceil((self.base_dist.icdf(1 - tail_mass / 2) - self.base_dist.mean).max() / self.delta + 0.5)
+        x = (torch.arange(L, R + 1, device=u.device).reshape(-1, *4*[1]) - u) * self.delta + self.base_dist.mean
+        # Assume pdf is locally linear then ln(p(x+-d/2)) = ln(p(x)*d) = ln(p(x)) + ln(d)
+        logits = self.log_prob(x) + torch.log(self.delta)
+        return OverflowCategorical(logits=logits, L=L, R=R)
+
+    def log_prob(self, y):
+        # return torch.log(self.base_dist.cdf(y + self.half) - self.base_dist.cdf(y - self.half)) - self.log_delta
+        if not hasattr(self.base_dist, "log_cdf"):
+            raise NotImplementedError(
+                "`log_prob()` is not implemented unless the base distribution implements `log_cdf()`.")
+        try:
+            return self._log_prob_with_logsf_and_logcdf(y)
+        except NotImplementedError:
+            return self._log_prob_with_logcdf(y)
+
+    @staticmethod
+    def _logsum_expbig_minus_expsmall(big, small):
+        # Numerically stable evaluation of log(exp(big) - exp(small)).
+        # https://github.com/tensorflow/compression/blob/a41fc70fc092bc6b72d5075deec34cbb47ef9077/tensorflow_compression/python/distributions/uniform_noise.py#L33
+        return torch.where(
+            torch.isinf(big), big, torch.log1p(-torch.exp(small - big)) + big
+        )
+
+    def _log_prob_with_logcdf(self, y):
+        return self._logsum_expbig_minus_expsmall(
+            self.base_dist.log_cdf(y + self.half), self.base_dist.log_cdf(y - self.half)) - self.log_delta
+
+    def _log_prob_with_logsf_and_logcdf(self, y):
+        """Compute log_prob(y) using log survival_function and cdf together."""
+        # There are two options that would be equal if we had infinite precision:
+        # Log[ sf(y - .5) - sf(y + .5) ]
+        #   = Log[ exp{logsf(y - .5)} - exp{logsf(y + .5)} ]
+        # Log[ cdf(y + .5) - cdf(y - .5) ]
+        #   = Log[ exp{logcdf(y + .5)} - exp{logcdf(y - .5)} ]
+        h = self.half
+        base = self.base_dist
+        logsf_y_plus = base.log_survival_function(y + h)
+        logsf_y_minus = base.log_survival_function(y - h)
+        logcdf_y_plus = base.log_cdf(y + h)
+        logcdf_y_minus = base.log_cdf(y - h)
+
+        # Important:  Here we use select in a way such that no input is inf, this
+        # prevents the troublesome case where the output of select can be finite,
+        # but the output of grad(select) will be NaN.
+
+        # In either case, we are doing Log[ exp{big} - exp{small} ]
+        # We want to use the sf items precisely when we are on the right side of the
+        # median, which occurs when logsf_y < logcdf_y.
+        condition = logsf_y_plus < logcdf_y_plus
+        big = torch.where(condition, logsf_y_minus, logcdf_y_plus)
+        small = torch.where(condition, logsf_y_plus, logcdf_y_minus)
+        return self._logsum_expbig_minus_expsmall(big, small) - self.log_delta
+
+
+class OverflowCategorical(torch.distributions.Categorical):
+    """
+    Discrete distribution over [L, L+1, ..., R-1, R] with LaPlace-based tail_masses for values <L and >R.
+    """
+
+    def __init__(self, logits, L, R):
+        self.L = L
+        self.R = R
+        # stable version of log(1 - sum_i exp(logp_i))
+        self.overflow = torch.log(torch.clip(- torch.expm1(torch.logsumexp(logits, dim=0)), min=0))
+        super().__init__(logits=torch.movedim(torch.cat([logits, self.overflow[None]], dim=0), 0, -1))
+
+
+class EntropyModel:
+    """
+    Entropy codec for discrete data based on Arithmetic Coding / Range Coding.
+    Adapted from https://github.com/tensorflow/compression.
+    For learned backward variances every symbol has a unique coding prior that requires a unique cdf table,
+    which is computed in parallel here.
+    """
+
+    def __init__(self, prior, range_coder_precision=16):
+        """
+
+        Inputs:
+        -------
+        prior     - [Categorical or OverflowCategorical] prior model over integers (optionally with allocated tail mass
+                    which will be encoded via Elias gamma code embedded into the range coder).
+        range_coder_precision - precision passed to the range coding op, how accurately prior is quantized.
+        """
+        super().__init__()
+        self.prior = prior
+        self.prior_shape = self.prior.probs.shape[:-1]
+        self.precision = range_coder_precision
+
+        # Build quantization tables
+        total = 2 ** self.precision
+        probs = self.prior.probs.reshape(-1, self.prior.probs.shape[-1])
+        quantized_pdf = torch.round(probs * total).to(torch.int32)
+        quantized_pdf = torch.clip(quantized_pdf, min=1)
+
+        # Normalize pdf so that sum pmf_i = 2 ** precision
+        while True:
+            mask = quantized_pdf.sum(dim=-1) > total
+            if not mask.any():
+                break
+            # m * (log2(v) - log2(v-1))
+            penalty = probs[mask] * (torch.log2(1 + 1 / (quantized_pdf[mask] - 1)))
+            # inf if v = 1 as intended but handle nan if also pmf = 0
+            idx = penalty.nan_to_num(torch.inf).argmin(dim=-1)
+            quantized_pdf[mask, idx] -= 1
+        while True:
+            mask = quantized_pdf.sum(axis=-1) < total
+            if not mask.any():
+                break
+            # m * (log2(v+1) - log2(v))
+            penalty = probs[mask] * (torch.log2(1 + 1 / quantized_pdf[mask]))
+            idx = penalty.argmax(dim=-1)
+            quantized_pdf[mask, idx] += 1
+
+        quantized_cdf = torch.cumsum(quantized_pdf, dim=-1)
+        self.quantized_cdf = torch.cat([
+            - self.precision * torch.ones((quantized_pdf.shape[0], 1), device=device),
+            torch.zeros((quantized_pdf.shape[0], 1), device=device),
+            quantized_cdf
+        ], dim=-1).reshape(-1)
+        self.indexes = torch.arange(quantized_pdf.shape[0], dtype=torch.int32)
+        self.offsets = self.prior.L if type(self.prior) is OverflowCategorical else 0
+
+    def compress(self, x):
+        """
+        Compresses a floating-point tensor to a bit string with the discretized prior.
+        """
+        x = (x - self.offsets).to(torch.int32).reshape(-1).cpu()
+        codec = gen_ops.create_range_encoder([], self.quantized_cdf.cpu())
+        codec = gen_ops.entropy_encode_index(codec, self.indexes.cpu(), x)
+        bits = gen_ops.entropy_encode_finalize(codec).numpy()
+        return bits
+
+    def decompress(self, bits):
+        """
+        Decompresses a tensor from bit strings. This requires knowledge of the image shape,
+        which for arbitrary images sizes needs to be sent as side-information.
+        """
+        bits = tf.convert_to_tensor(bits, dtype=tf.string)
+        codec = gen_ops.create_range_decoder(bits, self.quantized_cdf.cpu())
+        codec, x = gen_ops.entropy_decode_index(codec, self.indexes.cpu(), self.indexes.shape, tf.int32)
+        # sanity = gen_ops.entropy_decode_finalize(codec)
+        x = torch.from_numpy(x.numpy()).reshape(self.prior_shape).to(device).to(torch.float32) + self.offsets
+        return x
 
 
 class Diffusion(torch.nn.Module):
@@ -677,7 +957,7 @@ class Diffusion(torch.nn.Module):
         # q(z_s | z_t, x) = N(q_loc, q_scale^2)
         return NormalDistribution(loc=q_loc, scale=q_scale)
 
-    def relative_entropy_coding(self, q, p):
+    def relative_entropy_coding(self, q, p, compress_mode=None):
         # Exponential runtime with naive REC algorithms
         raise NotImplementedError
 
@@ -726,13 +1006,13 @@ class Diffusion(torch.nn.Module):
                 eps_hat = self.score_net(z_t, gamma_t)
             # Compute denoised prediction only if necessary
             if clip_denoised or cache_denoised:
-                x = (z_t - sigma_t * eps_hat) / alpha_t    # c.f. VDM eq (30)
+                x = (z_t - sigma_t * eps_hat) / alpha_t  # c.f. VDM eq (30)
             if clip_denoised:
                 x.clamp_(-1.0, 1.0)
             if cache_denoised:
                 self.denoised = x
 
-        # Variance of q(z_s | z_t, x)
+            # Variance of q(z_s | z_t, x)
             scale = sigma_s * torch.sqrt(expm1_term)
             # Additional modifications for p(z_s | z_t)
             if self.config.model.get('base_prior_scale', 'forward_kernel') == 'forward_kernel':
@@ -757,7 +1037,7 @@ class Diffusion(torch.nn.Module):
 
         return loc, scale
 
-    def transmit_q_s_t(self, x, z_t, t, s, cache_denoised=False):
+    def transmit_q_s_t(self, x, z_t, t, s, compress_mode=None, cache_denoised=False):
         """
         Perform a single transmission step of drawing a sample of z_t given z_s from q(z_t | z_s, x),
         under the conditional prior p(z_t | z_s).
@@ -765,9 +1045,10 @@ class Diffusion(torch.nn.Module):
 
         Inputs:
         -------
-        x     - the continuous data; belongs to the diffusion space (usually scaled to [-1, 1])
-        z_t   - the previously communicated latent state
-        t, s  - the previous and current time steps, in [0, 1]; s < t.
+        x             - the continuous data; belongs to the diffusion space (usually scaled to [-1, 1])
+        z_t           - the previously communicated latent state
+        t, s          - the previous and current time steps, in [0, 1]; s < t.
+        compress_mode - if to compress to bits in inference mode (which is slower), one of [None, 'encode', 'decode']
 
         Returns:
         --------
@@ -775,24 +1056,36 @@ class Diffusion(torch.nn.Module):
         rate - (estimate of) the KL divergence between q(z_s | z_t, x) and p(z_s | z_t)
         """
         # Compute parameters of q(z_s | z_t, x) and the prior p(z_s | z_t)
-        q_loc, q_scale = self.get_s_t_params(z_t, t, s, x=x)
         p_loc, p_scale = self.get_s_t_params(z_t, t, s, cache_denoised=cache_denoised)
+        q_loc, q_scale = self.get_s_t_params(z_t, t, s, x=x)
         p_s_t = self.p_s_t(p_loc, p_scale, t, s)
         q_s_t = self.q_s_t(q_loc, q_scale)
-        z_s, rate = self.relative_entropy_coding(q_s_t, p_s_t)
+        z_s, rate = self.relative_entropy_coding(q_s_t, p_s_t, compress_mode=compress_mode)
         return z_s, rate
 
-    def forward(self, x_raw, z_1=None, recon_method=None, seed=None):
+    def transmit_image(self, z_0, x_raw, compress_mode=None):
+        if compress_mode in ['encode', 'decode']:
+            p = torch.distributions.Categorical(logits=self.log_probs_x_z0(z_0=z_0))
+        if compress_mode == 'decode':
+            # consume bits
+            x_raw = self.entropy_decode(self.compress_bits.pop(0), p)
+        elif compress_mode == 'encode':
+            # accumulate bits
+            self.compress_bits += [self.entropy_encode(x_raw, p)]
+        return x_raw
+
+    def forward(self, x_raw, z_1=None, recon_method=None, compress_mode=None, seed=None):
         """
         Run a given data batch through the encoding/decoding path and compute the loss and other metrics.
 
         Inputs:
         -------
-        x            - batch of shape [B, C, H, W]
-        z_1          - if provided, will use this as the topmost latent state instead of sampling from q(z_1 | x).
-        recon_method - (optional) one of ['ancestral', 'denoise', 'flow-based']; determines how a progressive
-                       reconstruction will be computed based on an intermediate latent state.
-        seed         - allow for common randomness
+        x             - batch of shape [B, C, H, W]
+        z_1           - if provided, will use this as the topmost latent state instead of sampling from q(z_1 | x).
+        recon_method  - (optional) one of ['ancestral', 'denoise', 'flow-based']; determines how a progressive
+                        reconstruction will be computed based on an intermediate latent state.
+        compress_mode - if to compress to bits in inference mode (which is slower), one of [None, 'encode', 'decode']
+        seed          - allow for common randomness
         """
         rescale_to_bpd = 1. / (np.prod(x_raw.shape[1:]) * np.log(2.))
 
@@ -829,8 +1122,9 @@ class Diffusion(torch.nn.Module):
             z_t = z_s
             rate_t = rate_s
             t, s = times[i], times[i + 1]
-            with local_seed(seed, i=i+1):
-                z_s, rate_s = self.transmit_q_s_t(x, z_t, t, s, cache_denoised=recon_method == 'denoise')
+            with local_seed(seed, i=i + 1):
+                z_s, rate_s = self.transmit_q_s_t(x, z_t, t, s, compress_mode=compress_mode,
+                                                  cache_denoised=recon_method == 'denoise')
             loss_diff += rate_s
 
             if recon_method is not None:
@@ -857,6 +1151,7 @@ class Diffusion(torch.nn.Module):
         # Using the same likelihood model as in VDM.
         log_probs = self.log_probs_x_z0(z_0=z_0, x_raw=x_raw)
         loss_recon = -log_probs.sum(dim=[1, 2, 3])
+        x_raw = self.transmit_image(z_0, x_raw, compress_mode=compress_mode)
         if recon_method is not None:
             metrics += [{
                 'prog_bpds': loss_recon.cpu() * rescale_to_bpd,
@@ -909,7 +1204,7 @@ class Diffusion(torch.nn.Module):
 
         # for i in trange(len(times) - 1, desc="sampling"):
         for i in range(len(times) - 1):
-            t, s = times[i], times[i+1]
+            t, s = times[i], times[i + 1]
             p_loc, p_scale = self.get_s_t_params(z, t, s, clip_denoised=clip_samples, deterministic=deterministic)
             if deterministic:
                 z = p_loc
@@ -924,15 +1219,42 @@ class Diffusion(torch.nn.Module):
         else:
             return x_raw
 
-    @torch.inference_mode()
-    def compress(self, image):
-        # return a generator for the bits for each step
-        raise NotImplementedError
+    def entropy_encode(self, k, p):
+        """
+        Encode integer array k to bits using a prior / coding distribution p.
+        We might want to quantize scale for determinism and added stability across multiple machines.
+        """
+        # When using a scalar prior it would be better to quantize u as in tfc.UniversalBatchedEntropyModel
+        assert self.config.model.learned_prior_scale
+        em = EntropyModel(p)
+        bitstring = em.compress(k)
+        return bitstring
+
+    def entropy_decode(self, bits, p):
+        """
+        Decode integer array from bits using the prior p.
+        """
+        assert self.config.model.learned_prior_scale
+        em = EntropyModel(p)
+        k = em.decompress(bits)
+        return k
 
     @torch.inference_mode()
-    def decompress(self, compressed):
-        # consume the bits for each step, return a generator for the intermediate reconstructions for each step
-        raise NotImplementedError
+    def compress(self, image):
+        # return the bits for each step
+        self.compress_bits = []
+        # accumulate bits
+        self.forward(image.to(device), compress_mode='encode', seed=0)
+        return self.compress_bits
+
+    @torch.inference_mode()
+    def decompress(self, bits, image_shape, recon_method='denoise'):
+        # consume the bits for each step, return the intermediate reconstructions for each step
+        self.compress_bits = bits.copy()
+        # consume the bits for each step
+        _, metrics = self.forward(torch.zeros(image_shape, device=device), compress_mode='decode',
+                                  recon_method=recon_method, seed=0)
+        return metrics['prog_x_hats']
 
     def log_probs_x_z0(self, z_0, x_raw=None):
         """
@@ -1128,7 +1450,8 @@ class Diffusion(torch.nn.Module):
             if eval_iter is not None and (self.step % self.config.training.eval_every_steps == 0 or last):
                 n_batches = self.config.training.eval_steps_to_run
                 res = []
-                for batch in tqdm(islice(eval_iter, n_batches), total=n_batches or len(eval_iter), desc='Evaluating on test set'):
+                for batch in tqdm(islice(eval_iter, n_batches), total=n_batches or len(eval_iter),
+                                  desc='Evaluating on test set'):
                     batch = batch.to(device)
                     with torch.inference_mode():
                         self.ema.store(model.parameters())
@@ -1173,168 +1496,6 @@ class Diffusion(torch.nn.Module):
             print('Reconstructions via: %s\nbpps:  %s\npsnrs: %s\n' % (recon_method, bpps, psnrs))
 
 
-@contextmanager
-def local_seed(seed, i=0):
-    # Allow for local randomness, use hashing to get unique local seeds for subsequent draws
-    if seed is None:
-        yield
-    else:
-        with torch.random.fork_rng():
-            local_seed = hash((seed, i)) % (2 ** 32)
-            torch.manual_seed(local_seed)
-            yield
-
-
-class LogisticDistribution(TransformedDistribution):
-    """
-    Creates a logistic distribution parameterized by :attr:`loc` and :attr:`scale`
-    that define the affine transform of a standard logistic distribution.
-    Patterned after https://github.com/pytorch/pytorch/blob/main/torch/distributions/logistic_normal.py
-
-    Args:
-        loc (float or Tensor): mean of the base distribution
-        scale (float or Tensor): standard deviation of the base distribution
-
-    """
-    arg_constraints = {"loc": constraints.real, "scale": constraints.positive}
-
-    def __init__(self, loc, scale, validate_args=None):
-        self.loc = loc
-        self.scale = scale
-        base_dist = Uniform(torch.tensor(0, dtype=loc.dtype, device=loc.device),
-                            torch.tensor(1, dtype=loc.dtype, device=loc.device))
-        if not base_dist.batch_shape:
-            base_dist = base_dist.expand([1])
-        transforms = [SigmoidTransform().inv, AffineTransform(loc=loc, scale=scale)]
-        super().__init__(
-            base_dist, transforms, validate_args=validate_args
-        )
-
-    def expand(self, batch_shape, _instance=None):
-        new = self._get_checked_instance(LogisticDistribution, _instance)
-        return super().expand(batch_shape, _instance=new)
-
-    def cdf(self, x):
-        # Should be numerically more stable than the default.
-        return torch.sigmoid((x - self.loc) / self.scale)
-
-    @staticmethod
-    def log_sigmoid(x):
-        # A numerically more stable implementation of torch.log(torch.sigmoid(x)).
-        # c.f. https://jax.readthedocs.io/en/latest/_autosummary/jax.nn.log_sigmoid.html#jax.nn.log_sigmoid
-        return -torch.nn.functional.softplus(-x)
-
-    def log_cdf(self, x):
-        standardized = (x - self.loc) / self.scale
-        return self.log_sigmoid(standardized)
-
-    def log_survival_function(self, x):
-        standardized = (x - self.loc) / self.scale
-        return self.log_sigmoid(- standardized)
-
-
-class NormalDistribution(torch.distributions.Normal):
-    """
-    Overrides the Normal distribution to add a numerically more stable log_cdf
-    """
-
-    def log_cdf(self, x):
-        x = (x - self.loc) / self.scale
-        # more stable, for float32 ported from JAX, using log(1-x) ~= -x, x >> 1
-        # for small x
-        x_l = torch.clip(x, max=-10)
-        log_scale = -0.5 * x_l ** 2 - torch.log(-x_l) - 0.5 * np.log(2. * np.pi)
-        # asymptotic series
-        even_sum = torch.zeros_like(x)
-        odd_sum = torch.zeros_like(x)
-        x_2n = x_l ** 2
-        for n in range(1, 3 + 1):
-            y = np.prod(np.arange(2 * n - 1, 1, -2)) / x_2n
-            if n % 2:
-                odd_sum += y
-            else:
-                even_sum += y
-            x_2n *= x_l ** 2
-        x_lower = log_scale + torch.log(1 + even_sum - odd_sum)
-        return torch.where(
-            x > 5, -torch.special.ndtr(-x),
-            torch.where(x > -10, torch.special.ndtr(torch.clip(x, min=-10)).log(), x_lower))
-
-    def log_survival_function(self, x):
-        raise NotImplementedError
-
-
-class UniformNoisyDistribution(torch.distributions.Distribution):
-    """
-    Add uniform noise U[-delta/2, +delta/2] to a distribution.
-    Adapted from https://github.com/tensorflow/compression/blob/master/tensorflow_compression/python/distributions/uniform_noise.py
-    Also see https://pytorch.org/docs/stable/_modules/torch/distributions/distribution.html
-    """
-
-    arg_constraints = {}
-    # arg_constraints = {"delta": torch.distributions.constraints.nonnegative}
-
-    def __init__(self, base_dist, delta):
-        super().__init__()
-        self.base_dist = base_dist
-        self.delta = delta  # delta is the noise width.
-        self.half = delta / 2.
-        self.log_delta = torch.log(delta)
-
-    def sample(self, sample_shape=torch.Size([])):
-        x = self.base_dist.sample(sample_shape)
-        x += self.delta * torch.rand(x.shape, dtype=x.dtype, device=x.device) - self.half
-        return x
-
-    def log_prob(self, y):
-        # return torch.log(self.base_dist.cdf(y + self.half) - self.base_dist.cdf(y - self.half)) - self.log_delta
-        if not hasattr(self.base_dist, "log_cdf"):
-            raise NotImplementedError(
-                "`log_prob()` is not implemented unless the base distribution implements `log_cdf()`.")
-        try:
-            return self._log_prob_with_logsf_and_logcdf(y)
-        except NotImplementedError:
-            return self._log_prob_with_logcdf(y)
-
-    @staticmethod
-    def _logsum_expbig_minus_expsmall(big, small):
-        # Numerically stable evaluation of log(exp(big) - exp(small)).
-        # https://github.com/tensorflow/compression/blob/a41fc70fc092bc6b72d5075deec34cbb47ef9077/tensorflow_compression/python/distributions/uniform_noise.py#L33
-        return torch.where(
-            torch.isinf(big), big, torch.log1p(-torch.exp(small - big)) + big
-        )
-
-    def _log_prob_with_logcdf(self, y):
-        return self._logsum_expbig_minus_expsmall(
-            self.base_dist.log_cdf(y + self.half), self.base_dist.log_cdf(y - self.half)) - self.log_delta
-
-    def _log_prob_with_logsf_and_logcdf(self, y):
-        """Compute log_prob(y) using log survival_function and cdf together."""
-        # There are two options that would be equal if we had infinite precision:
-        # Log[ sf(y - .5) - sf(y + .5) ]
-        #   = Log[ exp{logsf(y - .5)} - exp{logsf(y + .5)} ]
-        # Log[ cdf(y + .5) - cdf(y - .5) ]
-        #   = Log[ exp{logcdf(y + .5)} - exp{logcdf(y - .5)} ]
-        h = self.half
-        base = self.base_dist
-        logsf_y_plus = base.log_survival_function(y + h)
-        logsf_y_minus = base.log_survival_function(y - h)
-        logcdf_y_plus = base.log_cdf(y + h)
-        logcdf_y_minus = base.log_cdf(y - h)
-
-        # Important:  Here we use select in a way such that no input is inf, this
-        # prevents the troublesome case where the output of select can be finite,
-        # but the output of grad(select) will be NaN.
-
-        # In either case, we are doing Log[ exp{big} - exp{small} ]
-        # We want to use the sf items precisely when we are on the right side of the
-        # median, which occurs when logsf_y < logcdf_y.
-        condition = logsf_y_plus < logcdf_y_plus
-        big = torch.where(condition, logsf_y_minus, logcdf_y_plus)
-        small = torch.where(condition, logsf_y_plus, logcdf_y_minus)
-        return self._logsum_expbig_minus_expsmall(big, small) - self.log_delta
-
-
 class UQDM(Diffusion):
     """
     Making Progressive Compression tractable with Universal Quantization.
@@ -1345,6 +1506,7 @@ class UQDM(Diffusion):
         See Diffusion.__init__ for hyperparameters.
         """
         super().__init__(config)
+        self.compress_bits = None
 
     def p_s_t(self, p_loc, p_scale, t, s):
         # p(z_s | z_t) is a convolution of g_t and U(+- d_t), d_t = sqrt(12) * sigma_s * sqrt(exmp1term)
@@ -1354,26 +1516,38 @@ class UQDM(Diffusion):
 
     def q_s_t(self, q_loc, q_scale):
         # q(z_s | z_t, x) = U(q_loc +- sqrt(3) * q_scale)
-        return Uniform(low=q_loc - torch.sqrt(3 * q_scale), high=q_loc + torch.sqrt(3 * q_scale))
+        return Uniform(low=q_loc - np.sqrt(3) * q_scale, high=q_loc + np.sqrt(3) * q_scale)
 
-    def relative_entropy_coding(self, q, p, seed=123):
+    def relative_entropy_coding(self, q, p, compress_mode=None):
         # Transmit sample z_s ~ q(z_s | z_t, x)
         if not torch.is_inference_mode_enabled():
             z_s = q.sample()
         else:
             # Apply universal quantization
-            # shared U(-0.5, 0.5)
-            if seed:
-                with torch.random.fork_rng():
-                    torch.manual_seed(seed)
-                    u = torch.rand(q.mean.shape, device=q.mean.device) - 0.5
-            else:
-                u = torch.rand(q.mean.shape, device=q.mean.device) - 0.5
+            # shared U(-0.5, 0.5), seeds have already been set in self.forward
+            u = torch.rand(q.mean.shape, device=q.mean.device) - 0.5
 
-            # Add dither U(-delta/2, delta/2)
-            quantized = torch.round((q.mean + p.delta * u) / p.delta)
+            # very slow, ~ 25 symbols/s
+            # cp = tfc.NoisyLogistic(loc=0.0, scale=(p.base_dist.scale / p.delta).cpu().numpy())
+            # em2 = tfc.UniversalBatchedEntropyModel(cp, coding_rank=4, compression=True, num_noise_levels=30)
+            # k = (q.mean - p.mean) / p.delta
+            # bitstring = em2.compress(k.cpu())
+            # k_hat = em2.decompress(bitstring, [])
+
+            if compress_mode in ['encode', 'decode']:
+                p_discrete = p.discretize(u)
+            if compress_mode == 'decode':
+                # consume bits
+                quantized = self.entropy_decode(self.compress_bits.pop(0), p_discrete)
+            else:
+                # Add dither U(-delta/2, delta/2)
+                # Transmit residual q - p for greater numerical stability
+                quantized = torch.round((q.mean - p.mean + p.delta * u) / p.delta)
+                if compress_mode == 'encode':
+                    # accumulate bits
+                    self.compress_bits += [self.entropy_encode(quantized, p_discrete)]
             # Subtract the same (pseudo-random) dither using shared randomness
-            z_s = quantized * p.delta - p.delta * u
+            z_s = quantized * p.delta + p.mean - p.delta * u
 
         # Evaluate z_s under log (posterior/prior) to get MC estimate of KL.
         rate = - p.log_prob(z_s) - torch.log(p.delta)
@@ -1393,8 +1567,12 @@ if __name__ == '__main__':
     # model.trainer(train_iter, eval_iter)
     model.evaluate(eval_iter, n_batches=10, seed=seed)
 
-    # Run inference for one image
-    # image = next(iter(eval_iter))
-    # compressed = model.compress(image)
-    # reconstructions = model.decompress(image)
-    # bits = [len(bits) for bits in reconstructions]
+    # Compress one image
+    image = next(iter(eval_iter))
+    compressed = model.compress(image)
+    bits = [len(b) * 8 for b in compressed]
+    reconstructions = model.decompress(compressed, image.shape, recon_method='denoise')
+    assert (reconstructions[-1] == image).all()
+
+    print('Reconstructions via: denoise, compression to bits\nbpps:  %s'
+          % np.round(np.cumsum(bits) / np.prod(image.shape) * 3, 4))
