@@ -15,9 +15,9 @@
     "n_attention_heads": 1,
     "n_channels": 3,
     "vocab_size": 256,
-    "embedding_dim": 32,
-    "n_blocks": 1,
-    "norm_groups": 8,
+    "embedding_dim": 64,
+    "n_blocks": 8,
+    "norm_groups": 16,
     "dropout_prob": 0.0
   },
   "training": {

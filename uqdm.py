@@ -922,6 +922,7 @@ class Diffusion(torch.nn.Module):
                                           eps=config.optim.eps, weight_decay=config.optim.weight_decay)
         self.step = 0
         self.denoised = None
+        self.compress_bits = []
 
     def sigma2(self, t):
         return torch.sigmoid(self.gamma(t))
@@ -1407,9 +1408,9 @@ class Diffusion(torch.nn.Module):
         }, self.self.config.checkpoint_path)
 
     def load(self, path):
-        cp = torch.load(path, map_location=device)
+        cp = torch.load(path, map_location=device, weights_only=False)
         # score_net + gamma
-        self.load_state_dict(cp['model'])
+        self.score_net.load_state_dict(cp['model'])
         self.ema.load_state_dict(cp['ema'])
         self.optimizer.load_state_dict(cp['optimizer'])
         self.step = cp['step']
@@ -1483,6 +1484,10 @@ class Diffusion(torch.nn.Module):
             X = X.to(device)
             ths_res = {}
             for recon_method in ('denoise', 'ancestral', 'flow_based'):
+                # If evaluating bpds as file sizes:
+                # self.compress_bits = []
+                # loss, metrics = self(X, recon_method=recon_method, seed=seed, compress_mode='encode')
+                # bpds = np.cumsum([len(b) * 8 for b in self.compress_bits]) / np.prod(X.shape)
                 loss, metrics = self(X, recon_method=recon_method, seed=seed)
                 bpds = np.cumsum(metrics['prog_bpds'].mean(dim=1))
                 psnrs = self.mse_to_psnr(metrics['prog_mses'].mean(dim=1), max_val=255.)
@@ -1561,7 +1566,10 @@ if __name__ == '__main__':
     torch.manual_seed(seed)
     torch.use_deterministic_algorithms(True)
 
-    model = load_checkpoint('checkpoints/uqdm-tiny')
+    # model = load_checkpoint('checkpoints/uqdm-tiny')
+    # model = load_checkpoint('checkpoints/uqdm-small')
+    model = load_checkpoint('checkpoints/uqdm-medium')
+    # model = load_checkpoint('checkpoints/uqdm-big')
     train_iter, eval_iter = load_data('ImageNet64', model.config.data)
 
     # model.trainer(train_iter, eval_iter)
@@ -1573,6 +1581,5 @@ if __name__ == '__main__':
     bits = [len(b) * 8 for b in compressed]
     reconstructions = model.decompress(compressed, image.shape, recon_method='denoise')
     assert (reconstructions[-1] == image).all()
-
     print('Reconstructions via: denoise, compression to bits\nbpps:  %s'
           % np.round(np.cumsum(bits) / np.prod(image.shape) * 3, 4))
