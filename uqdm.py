@@ -922,7 +922,6 @@ class Diffusion(torch.nn.Module):
                                           eps=config.optim.eps, weight_decay=config.optim.weight_decay)
         self.step = 0
         self.denoised = None
-        self.compress_bits = []
 
     def sigma2(self, t):
         return torch.sigmoid(self.gamma(t))
